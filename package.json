@@ -2,7 +2,7 @@
   "name": "subscription-bot-telegram",
   "version": "1.0.0",
   "type": "module",
-  "description": "",
+  "description": "A Telegram bot for managing group subscriptions with payment processing",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",

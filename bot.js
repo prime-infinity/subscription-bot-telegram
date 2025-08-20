@@ -1,23 +1,46 @@
 import TelegramBot from "node-telegram-bot-api";
 import sqlite3 from "sqlite3";
 import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
+// Get current directory for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 // Replace with your bot token from BotFather
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const PORT = process.env.PORT || 3000;
+
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN environment variable is required!");
   process.exit(1);
 }
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Initialize sqlite3 with verbose mode
-const db = new (sqlite3.verbose().Database)("bot.db");
+// Use webhook for production, polling for development
+const useWebhook = process.env.NODE_ENV === "production";
+
+let bot;
+if (useWebhook) {
+  // Production: Use webhook
+  bot = new TelegramBot(BOT_TOKEN);
+  bot.setWebHook(`${process.env.RENDER_EXTERNAL_URL}/bot${BOT_TOKEN}`);
+} else {
+  // Development: Use polling
+  bot = new TelegramBot(BOT_TOKEN, { polling: true });
+}
+
+// Ensure database directory exists and use absolute path
+const dbPath = path.join(__dirname, "bot.db");
+const db = new (sqlite3.verbose().Database)(dbPath);
 
 console.log("Bot token loaded:", BOT_TOKEN ? "✓" : "✗");
 console.log("Bot initialized:", bot ? "✓" : "✗");
 console.log("Database initialized:", db ? "✓" : "✗");
+console.log("Database path:", dbPath);
+console.log("Using webhook:", useWebhook);
 
 // Initialize database tables
 db.serialize(() => {
@@ -391,27 +414,6 @@ bot.on("callback_query", async (query) => {
         }
       );
 
-      // For immediate testing, you can use a shorter timeout (e.g., 1 minute)
-      // setTimeout(async () => {
-      //   db.get(
-      //     "SELECT * FROM payments WHERE id = ?",
-      //     [paymentId],
-      //     async (err, payment) => {
-      //       if (payment && payment.status === "approved") {
-      //         try {
-      //           await bot.banChatMember(payment.group_id, payment.user_id);
-      //           await bot.unbanChatMember(payment.group_id, payment.user_id);
-      //           console.log(
-      //             `User ${payment.user_id} removed from group ${payment.group_id} after expiry`
-      //           );
-      //         } catch (error) {
-      //           console.error("Error removing user:", error);
-      //         }
-      //       }
-      //     }
-      //   );
-      // }, 60000); // 1 minute for testing
-
       console.log(`User will be removed on: ${removalDate.toLocaleString()}`);
 
       bot.editMessageCaption(
@@ -548,11 +550,6 @@ bot.on("photo", async (msg) => {
   }
 });
 
-// Handle errors
-bot.on("polling_error", (error) => {
-  console.error("Polling error:", error);
-});
-
 // Function to check for expired subscriptions and remove users
 async function checkExpiredSubscriptions() {
   const now = new Date().toISOString();
@@ -609,4 +606,47 @@ setInterval(checkExpiredSubscriptions, 60 * 60 * 1000);
 // Check immediately on startup
 checkExpiredSubscriptions();
 
-console.log("🤖 Bot is running...");
+// Webhook endpoint for production
+if (useWebhook) {
+  import("express").then(({ default: express }) => {
+    const app = express();
+    app.use(express.json());
+
+    // Health check endpoint
+    app.get("/", (req, res) => {
+      res.json({
+        status: "Bot is running",
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || "development",
+      });
+    });
+
+    // Webhook endpoint
+    app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+      bot.processUpdate(req.body);
+      res.sendStatus(200);
+    });
+
+    const server = app.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Webhook server is running on port ${PORT}`);
+      console.log(`🤖 Bot is ready to receive updates`);
+    });
+
+    // Graceful shutdown
+    process.on("SIGTERM", () => {
+      console.log("SIGTERM received. Shutting down gracefully...");
+      server.close(() => {
+        console.log("Server closed");
+        db.close();
+        process.exit(0);
+      });
+    });
+  });
+} else {
+  // Handle errors for polling mode
+  bot.on("polling_error", (error) => {
+    console.error("Polling error:", error);
+  });
+}
+
+console.log("🤖 Bot initialization complete...");
