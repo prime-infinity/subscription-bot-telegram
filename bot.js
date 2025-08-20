@@ -1,21 +1,24 @@
 import TelegramBot from "node-telegram-bot-api";
-import sqlite3 from "sqlite3";
+import pkg from "pg";
+const { Pool } = pkg;
 import dotenv from "dotenv";
-import path from "path";
-import { fileURLToPath } from "url";
 
 dotenv.config();
-
-// Get current directory for ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Replace with your bot token from BotFather
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 
+// Supabase database connection
+const DATABASE_URL = process.env.DATABASE_URL;
+
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN environment variable is required!");
+  process.exit(1);
+}
+
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL environment variable is required!");
   process.exit(1);
 }
 
@@ -32,46 +35,26 @@ if (useWebhook) {
   bot = new TelegramBot(BOT_TOKEN, { polling: true });
 }
 
-// Ensure database directory exists and use absolute path
-const dbPath = path.join(__dirname, "bot.db");
-const db = new (sqlite3.verbose().Database)(dbPath);
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 
 console.log("Bot token loaded:", BOT_TOKEN ? "✓" : "✗");
-console.log("Bot initialized:", bot ? "✓" : "✗");
-console.log("Database initialized:", db ? "✓" : "✗");
-console.log("Database path:", dbPath);
+console.log("Bot initialized:", bot ? "✓" : "✓");
+console.log("Database connection:", DATABASE_URL ? "✓" : "✗");
 console.log("Using webhook:", useWebhook);
 
-// Initialize database tables
-db.serialize(() => {
-  // Groups table to store admin and payment info
-  db.run(`CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY,
-        group_id TEXT UNIQUE,
-        admin_id TEXT,
-        account_name TEXT,
-        account_number TEXT,
-        price TEXT
-    )`);
-
-  // Payments table to track user payments
-  db.run(`CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT,
-        username TEXT,
-        first_name TEXT,
-        group_id TEXT,
-        payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-        screenshot_file_id TEXT,
-        status TEXT DEFAULT 'pending',
-        added_date DATETIME,
-        removal_date DATETIME
-    )`);
-
-  // Add this after the existing CREATE TABLE statements
-  db.run(`ALTER TABLE groups ADD COLUMN bank_name TEXT`, (err) => {
-    // Ignore error if column already exists
-  });
+// Test database connection
+pool.query("SELECT NOW()", (err, res) => {
+  if (err) {
+    console.error("Database connection error:", err);
+  } else {
+    console.log("Database connected successfully at:", res.rows[0].now);
+  }
 });
 
 // Helper function to check if user is admin of a group
@@ -85,17 +68,21 @@ async function isGroupAdmin(groupId, userId) {
 }
 
 // Helper function to get group info
-function getGroupInfo(groupId) {
-  return new Promise((resolve, reject) => {
-    db.get("SELECT * FROM groups WHERE group_id = ?", [groupId], (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
+async function getGroupInfo(groupId) {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM groups WHERE group_id = $1",
+      [groupId]
+    );
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error("Error getting group info:", error);
+    throw error;
+  }
 }
 
 // Helper function to save group info
-function saveGroupInfo(
+async function saveGroupInfo(
   groupId,
   adminId,
   accountName,
@@ -103,47 +90,67 @@ function saveGroupInfo(
   bankName,
   price
 ) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      "INSERT OR REPLACE INTO groups (group_id, admin_id, account_name, account_number, bank_name, price) VALUES (?, ?, ?, ?, ?, ?)",
-      [groupId, adminId, accountName, accountNumber, bankName, price],
-      function (err) {
-        if (err) reject(err);
-        else resolve(this.lastID);
-      }
+  try {
+    const result = await pool.query(
+      `INSERT INTO groups (group_id, admin_id, account_name, account_number, bank_name, price) 
+       VALUES ($1, $2, $3, $4, $5, $6) 
+       ON CONFLICT (group_id) 
+       DO UPDATE SET 
+         admin_id = $2,
+         account_name = $3,
+         account_number = $4,
+         bank_name = $5,
+         price = $6
+       RETURNING id`,
+      [groupId, adminId, accountName, accountNumber, bankName, price]
     );
-  });
+    return result.rows[0].id;
+  } catch (error) {
+    console.error("Error saving group info:", error);
+    throw error;
+  }
 }
 
 // Helper function to save payment
-function savePayment(userId, username, firstName, groupId, screenshotFileId) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      "INSERT INTO payments (user_id, username, first_name, group_id, screenshot_file_id) VALUES (?, ?, ?, ?, ?)",
-      [userId, username, firstName, groupId, screenshotFileId],
-      function (err) {
-        if (err) reject(err);
-        else resolve(this.lastID);
-      }
+async function savePayment(
+  userId,
+  username,
+  firstName,
+  groupId,
+  screenshotFileId
+) {
+  try {
+    const result = await pool.query(
+      "INSERT INTO payments (user_id, username, first_name, group_id, screenshot_file_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+      [userId, username, firstName, groupId, screenshotFileId]
     );
-  });
+    return result.rows[0].id;
+  } catch (error) {
+    console.error("Error saving payment:", error);
+    throw error;
+  }
 }
 
 // Helper function to update payment status
-function updatePaymentStatus(paymentId, status, addedDate = null) {
-  return new Promise((resolve, reject) => {
-    const query = addedDate
-      ? "UPDATE payments SET status = ?, added_date = ? WHERE id = ?"
-      : "UPDATE payments SET status = ? WHERE id = ?";
-    const params = addedDate
-      ? [status, addedDate, paymentId]
-      : [status, paymentId];
+async function updatePaymentStatus(paymentId, status, addedDate = null) {
+  try {
+    let query, params;
 
-    db.run(query, params, function (err) {
-      if (err) reject(err);
-      else resolve(this.changes);
-    });
-  });
+    if (addedDate) {
+      query =
+        "UPDATE payments SET status = $1, added_date = $2 WHERE id = $3 RETURNING *";
+      params = [status, addedDate, paymentId];
+    } else {
+      query = "UPDATE payments SET status = $1 WHERE id = $2 RETURNING *";
+      params = [status, paymentId];
+    }
+
+    const result = await pool.query(query, params);
+    return result.rowCount;
+  } catch (error) {
+    console.error("Error updating payment status:", error);
+    throw error;
+  }
 }
 
 // Store user sessions for multi-step processes
@@ -260,42 +267,36 @@ bot.on("callback_query", async (query) => {
   try {
     if (data === "pay_for_access") {
       // Show list of available groups
-      db.all(
-        "SELECT * FROM groups WHERE account_name IS NOT NULL",
-        [],
-        (err, groups) => {
-          if (err) {
-            bot.answerCallbackQuery(query.id, { text: "Error loading groups" });
-            return;
-          }
-
-          if (groups.length === 0) {
-            bot.answerCallbackQuery(query.id, { text: "No groups available" });
-            bot.editMessageText(
-              "❌ No groups are currently accepting payments.",
-              { chat_id: chatId, message_id: query.message.message_id }
-            );
-            return;
-          }
-
-          const keyboard = {
-            reply_markup: {
-              inline_keyboard: groups.map((group) => [
-                {
-                  text: `Group ${group.group_id} - ₦${group.price}`,
-                  callback_data: `select_group_${group.group_id}`,
-                },
-              ]),
-            },
-          };
-
-          bot.editMessageText("Select a group to pay for:", {
-            chat_id: chatId,
-            message_id: query.message.message_id,
-            ...keyboard,
-          });
-        }
+      const result = await pool.query(
+        "SELECT * FROM groups WHERE account_name IS NOT NULL"
       );
+      const groups = result.rows;
+
+      if (groups.length === 0) {
+        bot.answerCallbackQuery(query.id, { text: "No groups available" });
+        bot.editMessageText("❌ No groups are currently accepting payments.", {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+        });
+        return;
+      }
+
+      const keyboard = {
+        reply_markup: {
+          inline_keyboard: groups.map((group) => [
+            {
+              text: `Group ${group.group_id} - ₦${group.price}`,
+              callback_data: `select_group_${group.group_id}`,
+            },
+          ]),
+        },
+      };
+
+      bot.editMessageText("Select a group to pay for:", {
+        chat_id: chatId,
+        message_id: query.message.message_id,
+        ...keyboard,
+      });
     } else if (data.startsWith("select_group_")) {
       const groupId = data.replace("select_group_", "");
       const groupInfo = await getGroupInfo(groupId);
@@ -316,11 +317,11 @@ bot.on("callback_query", async (query) => {
         };
 
         bot.editMessageText(
-          `Payment Details\\n\\n` +
-            `Amount: ₦${groupInfo.price}\\n` +
-            `Bank Name: ${groupInfo.bank_name}\\n` +
-            `Account Name: ${groupInfo.account_name}\\n` +
-            `Account Number: ${groupInfo.account_number}\\n\\n` +
+          `Payment Details\n\n` +
+            `Amount: ₦${groupInfo.price}\n` +
+            `Bank Name: ${groupInfo.bank_name}\n` +
+            `Account Name: ${groupInfo.account_name}\n` +
+            `Account Number: ${groupInfo.account_number}\n\n` +
             `Please make the payment and click "Payment Made" below, then send your payment receipt.`,
           { chat_id: chatId, message_id: query.message.message_id, ...keyboard }
         );
@@ -358,74 +359,62 @@ bot.on("callback_query", async (query) => {
       const isAdmin = await isGroupAdmin(groupId, userId);
 
       if (isAdmin) {
-        db.all(
-          "SELECT * FROM payments WHERE group_id = ? AND status = 'pending' ORDER BY payment_date DESC",
-          [groupId],
-          (err, payments) => {
-            if (err || payments.length === 0) {
-              bot.sendMessage(chatId, "No pending payments found.");
-              return;
-            }
-
-            payments.forEach((payment) => {
-              const keyboard = {
-                reply_markup: {
-                  inline_keyboard: [
-                    [
-                      {
-                        text: "User Added to Group",
-                        callback_data: `user_added_${payment.id}`,
-                      },
-                    ],
-                    [
-                      {
-                        text: "Reject Payment",
-                        callback_data: `reject_payment_${payment.id}`,
-                      },
-                    ],
-                  ],
-                },
-              };
-
-              bot.sendPhoto(chatId, payment.screenshot_file_id, {
-                caption:
-                  `Payment Receipt\n\n` +
-                  `User: ${payment.first_name} (@${
-                    payment.username || "N/A"
-                  })\n` +
-                  `User ID: ${payment.user_id}\n` +
-                  `Date: ${new Date(
-                    payment.payment_date
-                  ).toLocaleString()}\n\n` +
-                  `Please add this user to the group manually, then click "User Added" below.`,
-                ...keyboard,
-              });
-            });
-          }
+        const result = await pool.query(
+          "SELECT * FROM payments WHERE group_id = $1 AND status = 'pending' ORDER BY payment_date DESC",
+          [groupId]
         );
+        const payments = result.rows;
+
+        if (payments.length === 0) {
+          bot.sendMessage(chatId, "No pending payments found.");
+          return;
+        }
+
+        payments.forEach((payment) => {
+          const keyboard = {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: "User Added to Group",
+                    callback_data: `user_added_${payment.id}`,
+                  },
+                ],
+                [
+                  {
+                    text: "Reject Payment",
+                    callback_data: `reject_payment_${payment.id}`,
+                  },
+                ],
+              ],
+            },
+          };
+
+          bot.sendPhoto(chatId, payment.screenshot_file_id, {
+            caption:
+              `Payment Receipt\n\n` +
+              `User: ${payment.first_name} (@${payment.username || "N/A"})\n` +
+              `User ID: ${payment.user_id}\n` +
+              `Date: ${new Date(payment.payment_date).toLocaleString()}\n\n` +
+              `Please add this user to the group manually, then click "User Added" below.`,
+            ...keyboard,
+          });
+        });
       }
     } else if (data.startsWith("user_added_")) {
       const paymentId = data.replace("user_added_", "");
-      await updatePaymentStatus(
-        paymentId,
-        "approved",
-        new Date().toISOString()
-      );
+      const addedDate = new Date().toISOString();
+      await updatePaymentStatus(paymentId, "approved", addedDate);
 
-      // Schedule user removal after 30 days using a more reliable method
+      // Schedule user removal after 30 days
       const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000; // 30 days in milliseconds
       const removalDate = new Date(Date.now() + thirtyDaysMs);
 
       // Store removal task in database for persistence
-      db.run(
-        "UPDATE payments SET removal_date = ? WHERE id = ?",
-        [removalDate.toISOString(), paymentId],
-        function (err) {
-          if (err) {
-            console.error("Error storing removal date:", err);
-          }
-        }
-      );
+      await pool.query("UPDATE payments SET removal_date = $1 WHERE id = $2", [
+        removalDate.toISOString(),
+        paymentId,
+      ]);
 
       console.log(`User will be removed on: ${removalDate.toLocaleString()}`);
 
@@ -464,25 +453,25 @@ bot.on("message", async (msg) => {
   const session = userSessions[userId];
 
   if (session) {
-    if (session.step === "account_name") {
-      session.accountName = msg.text;
-      session.step = "bank_name";
-      bot.sendMessage(chatId, "🏦 Please enter the bank name:");
-    } else if (session.step === "bank_name") {
-      session.bankName = msg.text;
-      session.step = "account_number";
-      bot.sendMessage(chatId, "🔢 Please enter the account number:");
-    } else if (session.step === "account_number") {
-      session.accountNumber = msg.text;
-      session.step = "price";
-      bot.sendMessage(
-        chatId,
-        "💰 Please enter the subscription price (numbers only, e.g., 1000):"
-      );
-    } else if (session.step === "price") {
-      const price = msg.text;
+    try {
+      if (session.step === "account_name") {
+        session.accountName = msg.text;
+        session.step = "bank_name";
+        bot.sendMessage(chatId, "🏦 Please enter the bank name:");
+      } else if (session.step === "bank_name") {
+        session.bankName = msg.text;
+        session.step = "account_number";
+        bot.sendMessage(chatId, "🔢 Please enter the account number:");
+      } else if (session.step === "account_number") {
+        session.accountNumber = msg.text;
+        session.step = "price";
+        bot.sendMessage(
+          chatId,
+          "💰 Please enter the subscription price (numbers only, e.g., 1000):"
+        );
+      } else if (session.step === "price") {
+        const price = msg.text;
 
-      try {
         await saveGroupInfo(
           session.groupId,
           userId,
@@ -493,21 +482,21 @@ bot.on("message", async (msg) => {
         );
         bot.sendMessage(
           chatId,
-          `✅ Payment details saved successfully!\\n\\n` +
-            `Bank Name: ${session.bankName}\\n` +
-            `Account Name: ${session.accountName}\\n` +
-            `Account Number: ${session.accountNumber}\\n` +
-            `Price: ₦${price}\\n\\n` +
+          `✅ Payment details saved successfully!\n\n` +
+            `Bank Name: ${session.bankName}\n` +
+            `Account Name: ${session.accountName}\n` +
+            `Account Number: ${session.accountNumber}\n` +
+            `Price: ₦${price}\n\n` +
             `Your group is now ready to accept payments!`
         );
         delete userSessions[userId];
-      } catch (error) {
-        bot.sendMessage(
-          chatId,
-          "❌ Error saving payment details. Please try again."
-        );
-        console.error(error);
       }
+    } catch (error) {
+      bot.sendMessage(
+        chatId,
+        "❌ Error saving payment details. Please try again."
+      );
+      console.error(error);
     }
   }
 });
@@ -571,52 +560,48 @@ bot.on("photo", async (msg) => {
 
 // Function to check for expired subscriptions and remove users
 async function checkExpiredSubscriptions() {
-  const now = new Date().toISOString();
+  try {
+    const now = new Date().toISOString();
 
-  db.all(
-    "SELECT * FROM payments WHERE status = 'approved' AND removal_date <= ? AND removal_date IS NOT NULL",
-    [now],
-    async (err, expiredPayments) => {
-      if (err) {
-        console.error("Error checking expired subscriptions:", err);
-        return;
-      }
+    const result = await pool.query(
+      "SELECT * FROM payments WHERE status = 'approved' AND removal_date <= $1 AND removal_date IS NOT NULL",
+      [now]
+    );
+    const expiredPayments = result.rows;
 
-      for (const payment of expiredPayments) {
+    for (const payment of expiredPayments) {
+      try {
+        // Use banChatMember then unbanChatMember to remove user (modern method)
+        await bot.banChatMember(payment.group_id, payment.user_id);
+        await bot.unbanChatMember(payment.group_id, payment.user_id);
+
+        // Update payment status to expired
+        await updatePaymentStatus(payment.id, "expired");
+
+        console.log(
+          `User ${payment.user_id} (${payment.first_name}) removed from group ${payment.group_id} - subscription expired`
+        );
+
+        // Optionally notify the user
         try {
-          // Use banChatMember then unbanChatMember to remove user (modern method)
-          await bot.banChatMember(payment.group_id, payment.user_id);
-          await bot.unbanChatMember(payment.group_id, payment.user_id);
-
-          // Update payment status to expired
-          await updatePaymentStatus(payment.id, "expired");
-
-          console.log(
-            `User ${payment.user_id} (${payment.first_name}) removed from group ${payment.group_id} - subscription expired`
+          await bot.sendMessage(
+            payment.user_id,
+            `⏰ Your subscription to group ${payment.group_id} has expired. You have been removed from the group.\n\n` +
+              `To rejoin, please make a new payment.`
           );
-
-          // Optionally notify the user
-          try {
-            await bot.sendMessage(
-              payment.user_id,
-              `⏰ Your subscription to group ${payment.group_id} has expired. You have been removed from the group.\n\n` +
-                `To rejoin, please make a new payment.`
-            );
-          } catch (notifyError) {
-            console.log(
-              "Could not notify user of expiration:",
-              notifyError.message
-            );
-          }
-        } catch (error) {
-          console.error(
-            `Error removing expired user ${payment.user_id}:`,
-            error
+        } catch (notifyError) {
+          console.log(
+            "Could not notify user of expiration:",
+            notifyError.message
           );
         }
+      } catch (error) {
+        console.error(`Error removing expired user ${payment.user_id}:`, error);
       }
     }
-  );
+  } catch (error) {
+    console.error("Error checking expired subscriptions:", error);
+  }
 }
 
 // Check for expired subscriptions every hour
@@ -656,7 +641,7 @@ if (useWebhook) {
       console.log("SIGTERM received. Shutting down gracefully...");
       server.close(() => {
         console.log("Server closed");
-        db.close();
+        pool.end();
         process.exit(0);
       });
     });
@@ -667,5 +652,12 @@ if (useWebhook) {
     console.error("Polling error:", error);
   });
 }
+
+// Graceful shutdown for development mode
+process.on("SIGINT", () => {
+  console.log("SIGINT received. Shutting down gracefully...");
+  pool.end();
+  process.exit(0);
+});
 
 console.log("🤖 Bot initialization complete...");
