@@ -67,6 +67,11 @@ db.serialize(() => {
         added_date DATETIME,
         removal_date DATETIME
     )`);
+
+  // Add this after the existing CREATE TABLE statements
+  db.run(`ALTER TABLE groups ADD COLUMN bank_name TEXT`, (err) => {
+    // Ignore error if column already exists
+  });
 });
 
 // Helper function to check if user is admin of a group
@@ -90,11 +95,18 @@ function getGroupInfo(groupId) {
 }
 
 // Helper function to save group info
-function saveGroupInfo(groupId, adminId, accountName, accountNumber, price) {
+function saveGroupInfo(
+  groupId,
+  adminId,
+  accountName,
+  accountNumber,
+  bankName,
+  price
+) {
   return new Promise((resolve, reject) => {
     db.run(
-      "INSERT OR REPLACE INTO groups (group_id, admin_id, account_name, account_number, price) VALUES (?, ?, ?, ?, ?)",
-      [groupId, adminId, accountName, accountNumber, price],
+      "INSERT OR REPLACE INTO groups (group_id, admin_id, account_name, account_number, bank_name, price) VALUES (?, ?, ?, ?, ?, ?)",
+      [groupId, adminId, accountName, accountNumber, bankName, price],
       function (err) {
         if (err) reject(err);
         else resolve(this.lastID);
@@ -304,10 +316,11 @@ bot.on("callback_query", async (query) => {
         };
 
         bot.editMessageText(
-          `Payment Details\n\n` +
-            `Amount: ₦${groupInfo.price}\n` +
-            `Account Name: ${groupInfo.account_name}\n` +
-            `Account Number: ${groupInfo.account_number}\n\n` +
+          `Payment Details\\n\\n` +
+            `Amount: ₦${groupInfo.price}\\n` +
+            `Bank Name: ${groupInfo.bank_name}\\n` +
+            `Account Name: ${groupInfo.account_name}\\n` +
+            `Account Number: ${groupInfo.account_number}\\n\\n` +
             `Please make the payment and click "Payment Made" below, then send your payment receipt.`,
           { chat_id: chatId, message_id: query.message.message_id, ...keyboard }
         );
@@ -453,6 +466,10 @@ bot.on("message", async (msg) => {
   if (session) {
     if (session.step === "account_name") {
       session.accountName = msg.text;
+      session.step = "bank_name";
+      bot.sendMessage(chatId, "🏦 Please enter the bank name:");
+    } else if (session.step === "bank_name") {
+      session.bankName = msg.text;
       session.step = "account_number";
       bot.sendMessage(chatId, "🔢 Please enter the account number:");
     } else if (session.step === "account_number") {
@@ -471,14 +488,16 @@ bot.on("message", async (msg) => {
           userId,
           session.accountName,
           session.accountNumber,
+          session.bankName,
           price
         );
         bot.sendMessage(
           chatId,
-          `✅ Payment details saved successfully!\n\n` +
-            `Account Name: ${session.accountName}\n` +
-            `Account Number: ${session.accountNumber}\n` +
-            `Price: ₦${price}\n\n` +
+          `✅ Payment details saved successfully!\\n\\n` +
+            `Bank Name: ${session.bankName}\\n` +
+            `Account Name: ${session.accountName}\\n` +
+            `Account Number: ${session.accountNumber}\\n` +
+            `Price: ₦${price}\\n\\n` +
             `Your group is now ready to accept payments!`
         );
         delete userSessions[userId];
